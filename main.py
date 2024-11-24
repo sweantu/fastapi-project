@@ -1,24 +1,30 @@
 from motor.motor_asyncio import AsyncIOMotorClient
 from fastapi import FastAPI, HTTPException
-
 from fastapi.middleware.cors import CORSMiddleware
-
-from pydantic import BaseModel, Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import BaseModel, Field, model_validator
+from pydantic_settings import BaseSettings
 from passlib.context import CryptContext
+from pymongo.errors import DuplicateKeyError
+import logging
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Configuration settings
 class Settings(BaseSettings):
     mongodb_uri: str
     secret_key: str
     debug: bool = False
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
 
 settings = Settings()
 
-
+# Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -30,7 +36,8 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
 
-app = FastAPI()
+# Initialize FastAPI app
+app = FastAPI(debug=settings.debug)
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,40 +47,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global variables for MongoDB client and database
+client = None
+db = None
+
 
 @app.on_event("startup")
 async def create_indexes():
-    global client
-    client = AsyncIOMotorClient(settings.mongodb_uri)
-    global db
-    db = client.get_database("fastapi_project")
-    await db.user.create_index("username", unique=True)
-    print("Server starts successfully")
+    global client, db
+    try:
+        client = AsyncIOMotorClient(settings.mongodb_uri)
+        db = client.get_database("fastapi_project")
+        await db.user.create_index("username", unique=True)
+        # Check MongoDB connection
+        await db.command("ping")
+        logger.info("Connected to MongoDB and created indexes successfully")
+    except Exception as e:
+        logger.error(f"Failed to connect to MongoDB: {e}")
+        raise RuntimeError("Failed to connect to MongoDB")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    client.close()
-    print("Server closes successfully")
+    if client:
+        client.close()
+        logger.info("MongoDB connection closed")
 
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {"message": "Welcome to the FastAPI application"}
 
 
 @app.get("/ping/mongodb")
 async def ping_mongodb():
     try:
         await db.command("ping")
-        return {
-            "message": "Pinged your deployment. You successfully connected to MongoDB!"
-        }
+        return {"message": "Successfully connected to MongoDB!"}
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        logger.error(f"MongoDB ping failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to connect to MongoDB")
 
 
+# User model for input validation
 class User(BaseModel):
     username: str = Field(
         ...,
@@ -92,29 +108,28 @@ class User(BaseModel):
         max_length=20,
     )
 
-    # @field_validator("password")
-    # def validate_password(cls, password: str) -> str:
-    # if len(password) < 8:
-    #     raise HTTPException(
-    #         status_code=422, detail="Password must be at least 8 characters long."
-    #     )
-    # if not any(char.isdigit() for char in password):
-    #     raise HTTPException(
-    #         status_code=422, detail="Password must contains at least one number."
-    #     )
-    # if not any(char.isupper() for char in password):
-    #     raise HTTPException(
-    #         status_code=422,
-    #         detail="Password must contain at least one uppercase letter.",
-    #     )
-    # if not any(char in "!@#$%^&*()-_+=" for char in password):
-    #     raise HTTPException(
-    #         status_code=422,
-    #         detail="Password must contain at least one special character.",
-    #     )
-    # return hash_password(password)
+    @model_validator(mode="before")
+    def validate_password(cls, values):
+        password = values.get("password")
+        if not password:
+            raise ValueError("Password is required.")
+
+        # Check for at least one digit
+        if not any(char.isdigit() for char in password):
+            raise ValueError("Password must contain at least one digit.")
+
+        # Check for at least one special character
+        if not any(char in "!@#$%^&*()-_+=" for char in password):
+            raise ValueError("Password must contain at least one special character.")
+
+        # Check for at least one letter
+        if not any(char.isalpha() for char in password):
+            raise ValueError("Password must contain at least one letter.")
+
+        return values
 
 
+# Response model for successful registration
 class UserResponse(BaseModel):
     id: str
     username: str
@@ -127,22 +142,31 @@ class RegisterResponse(BaseModel):
 
 
 @app.post("/users/register", response_model=RegisterResponse)
-async def user_register(user_model: User):
+async def user_register(user: User):
     try:
-        existing_user = await db.user.find_one({"username": user_model.username})
+        # Check if username already exists
+        existing_user = await db.user.find_one({"username": user.username})
         if existing_user:
-            raise ValueError("Username already exists")
-        user_model.password = hash_password(user_model.password)
-        result = await db.user.insert_one(user_model.model_dump())
-        user = await db.user.find_one({"_id": result.inserted_id})
+            raise HTTPException(status_code=422, detail="Username already exists")
+
+        # Hash the password and store user
+        hashed_password = hash_password(user.password)
+        user_data = user.dict()
+        user_data["password"] = hashed_password
+        result = await db.user.insert_one(user_data)
+
+        # Retrieve the created user
+        created_user = await db.user.find_one({"_id": result.inserted_id})
         return RegisterResponse(
             message="User registered successfully",
             user=UserResponse(
-                id=str(user["_id"]), username=user["username"], name=user["name"]
+                id=str(created_user["_id"]),
+                username=created_user["username"],
+                name=created_user["name"],
             ),
         )
-    except ValueError as ve:
-        raise HTTPException(status_code=422, detail=str(ve))
+    except DuplicateKeyError:
+        raise HTTPException(status_code=422, detail="Username already exists")
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Unexpected error during user registration: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
