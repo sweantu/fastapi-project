@@ -147,7 +147,8 @@ async def user_register(user: User):
         # Check if username already exists
         existing_user = await db.user.find_one({"username": user.username})
         if existing_user:
-            raise HTTPException(status_code=422, detail="Username already exists")
+            logger.error("ahihi")
+            raise ValueError("Username already exists")
 
         # Hash the password and store user
         hashed_password = hash_password(user.password)
@@ -165,8 +166,8 @@ async def user_register(user: User):
                 name=created_user["name"],
             ),
         )
-    except DuplicateKeyError:
-        raise HTTPException(status_code=422, detail="Username already exists")
+    except ValueError as ve:
+        raise HTTPException(status_code=422, detail=str(ve))
     except Exception as e:
         logger.error(f"Unexpected error during user registration: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
