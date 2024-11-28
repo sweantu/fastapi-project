@@ -1,11 +1,61 @@
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings
 from passlib.context import CryptContext
-from pymongo.errors import DuplicateKeyError
 import logging
+
+import jwt
+from jwt.exceptions import InvalidTokenError
+
+# to get a string like this run:
+# openssl rand -hex 32
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 1
+
+
+class TokenData(BaseModel):
+    username: str | None = None
+
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, settings.secret_key, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(
+    token: Annotated[HTTPAuthorizationCredentials, Depends(HTTPBearer())]
+):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(
+            token.credentials, settings.secret_key, algorithms=[ALGORITHM]
+        )
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except InvalidTokenError:
+        raise credentials_exception
+    user = await db.user.find_one({"username": token_data.username})
+    if user is None:
+        raise credentials_exception
+    return user
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -147,7 +197,6 @@ async def user_register(user: User):
         # Check if username already exists
         existing_user = await db.user.find_one({"username": user.username})
         if existing_user:
-            logger.error("ahihi")
             raise ValueError("Username already exists")
 
         # Hash the password and store user
@@ -171,3 +220,52 @@ async def user_register(user: User):
     except Exception as e:
         logger.error(f"Unexpected error during user registration: {e}")
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+class LoginResponse(BaseModel):
+    message: str
+    user: UserResponse
+    token: str
+
+
+class LoginModel(BaseModel):
+    username: str = Field(..., min_length=6, max_length=20, pattern="^[a-z][a-z0-9]*$")
+    password: str = Field(..., min_length=6, max_length=20)
+
+
+@app.post("/users/login", response_model=LoginResponse)
+async def user_login(login_model: LoginModel):
+    try:
+        user = await db.user.find_one({"username": login_model.username})
+        if not user:
+            raise ValueError("Username or password is not correct")
+        if not verify_password(login_model.password, user["password"]):
+            raise ValueError("Username or password is not correct")
+        ## create token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user["username"]}, expires_delta=access_token_expires
+        )
+        return LoginResponse(
+            message="User logined successfully",
+            user=UserResponse(
+                id=str(user["_id"]), username=user["username"], name=user["name"]
+            ),
+            token=access_token,
+        )
+    except ValueError as ve:
+        raise HTTPException(status_code=401, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Unexpected error during user login: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+@app.get("/users/me/", response_model=UserResponse)
+async def read_users_me(
+    current_user: Annotated[User, Depends(get_current_user)],
+):
+    return UserResponse(
+        id=str(current_user["_id"]),
+        username=current_user["username"],
+        name=current_user["name"],
+    )
